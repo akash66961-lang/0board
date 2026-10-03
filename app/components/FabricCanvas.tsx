@@ -2,33 +2,9 @@
 
 import {
 	Canvas,
-	Circle,
 	type FabricObject,
-	Line,
-	PencilBrush,
-	Rect,
 	Textbox,
-	Triangle,
 } from "fabric";
-import {
-	applyControlStyle,
-	canvasToJSON,
-	createArrowParts,
-	createStickyNote,
-	DEFAULT_STICKY_COLOR,
-	findArrowParts,
-	findStickyParts,
-	hexToRgba,
-	migrateAndWireStickies,
-	migrateLegacyArrows,
-	placeHead,
-	eraserCursor,
-	reshapeArrow,
-	snapshotCanvas,
-	styleCanvasObjects,
-	uid,
-	wireStickyGrow,
-} from "./diagramShapes";
 import {
 	forwardRef,
 	useCallback,
@@ -36,34 +12,42 @@ import {
 	useImperativeHandle,
 	useRef,
 } from "react";
+import {
+	canRedo,
+	canUndo,
+	createHistory,
+	pushHistory,
+	redoHistory,
+	resetHistory,
+	undoHistory,
+	type HistoryStack,
+} from "../lib/canvasHistory";
+import {
+	applyControlStyle,
+	findArrowParts,
+	findStickyParts,
+	linkIdOf,
+	normalizeLoadedCanvas,
+	syncArrowHandleVisibility,
+} from "../lib/canvasState";
+import { reshapeArrow } from "../lib/diagramArrows";
+import {
+	backgroundFor,
+	canvasToJSON,
+	DEFAULT_ERASER_SIZE,
+	FONT_LOAD_TIMEOUT,
+	HISTORY_DEBOUNCE_MS,
+	HISTORY_LIMIT,
+	snapshotCanvas,
+} from "../lib/diagramConstants";
+import type {
+	FabricCanvasAPI,
+	Point,
+	Tool,
+} from "../lib/diagramTypes";
+import { rebindTool } from "../lib/toolBindings";
 
-export type Tool =
-	| "select"
-	| "draw"
-	| "highlighter"
-	| "rect"
-	| "circle"
-	| "line"
-	| "arrow"
-	| "text"
-	| "sticky"
-	| "eraser";
-
-export interface FabricCanvasAPI {
-	getJSON: () => ReturnType<Canvas["toJSON"]>;
-	loadJSON: (json: ReturnType<Canvas["toJSON"]>) => Promise<void>;
-	undo: () => void;
-	redo: () => void;
-	canUndo: () => boolean;
-	canRedo: () => boolean;
-	clear: () => void;
-	forceSave: () => void;
-	flushEditing: () => void;
-	isLoading: () => boolean;
-	snapshotImage: () => string | null;
-	capturePage: (json: Record<string, unknown>) => Promise<string | null>;
-	getCanvasElement: () => HTMLCanvasElement | null;
-}
+export type { FabricCanvasAPI, Tool };
 
 interface FabricCanvasProps {
 	onChange?: () => void;
@@ -72,6 +56,7 @@ interface FabricCanvasProps {
 	strokeColor: string;
 	fillColor: string;
 	strokeWidth: number;
+	eraserSize?: number;
 	fontFamily?: string;
 	fontBold?: boolean;
 	fontItalic?: boolean;
@@ -82,53 +67,62 @@ interface FabricCanvasProps {
 	darkMode?: boolean;
 }
 
-const MIN_SHAPE_SIZE = 5;
-const FONT_LOAD_TIMEOUT = 3000;
-
 const FabricCanvas = forwardRef<FabricCanvasAPI, FabricCanvasProps>(
 	(
-		{
-			onChange,
-			onHistoryChange,
-			tool,
-			strokeColor,
-			fillColor,
-			strokeWidth,
-			fontFamily,
-			fontBold,
-			fontItalic,
-			fontUnderline,
-		pageJson,
-		pageKey,
-		onToolChange,
-		darkMode = false,
-	}: FabricCanvasProps,
+	{
+		onChange,
+		onHistoryChange,
+		tool,
+		strokeColor,
+		fillColor,
+		strokeWidth,
+		eraserSize = DEFAULT_ERASER_SIZE,
+		fontFamily,
+		fontBold,
+		fontItalic,
+		fontUnderline,
+	pageJson,
+	pageKey,
+	onToolChange,
+	darkMode = false,
+}: FabricCanvasProps,
 	ref,
 ) => {
-		const containerRef = useRef<HTMLDivElement>(null);
-		const canvasElRef = useRef<HTMLCanvasElement>(null);
-		const fabricRef = useRef<Canvas | null>(null);
-		const historyRef = useRef<string[]>([]);
-		const redoStackRef = useRef<string[]>([]);
-		const isLoadingRef = useRef(false);
-		const drawingShapeRef = useRef<FabricObject | null>(null);
-		const shapeStartRef = useRef<{ x: number; y: number } | null>(null);
-		const isDrawingRef = useRef(false);
-		const initializedRef = useRef(false);
-		const fontLoadedRef = useRef(false);
-		const lastLoadedPageKeyRef = useRef<number>(-1);
-		const arrowHeadRef = useRef<FabricObject | null>(null);
+	const containerRef = useRef<HTMLDivElement>(null);
+	const canvasElRef = useRef<HTMLCanvasElement>(null);
+	const fabricRef = useRef<Canvas | null>(null);
+	const historyRef = useRef<HistoryStack>(createHistory(HISTORY_LIMIT));
+	const isLoadingRef = useRef(false);
+	const drawingShapeRef = useRef<FabricObject | null>(null);
+	const shapeStartRef = useRef<{ x: number; y: number } | null>(null);
+	const initializedRef = useRef(false);
+	const fontLoadedRef = useRef(false);
+	const lastLoadedPageKeyRef = useRef<number>(-1);
+	const arrowHeadRef = useRef<FabricObject | null>(null);
+	/** Eraser stroke state, so a drag erases continuously. */
+	const isErasingRef = useRef(false);
+	const lastErasePointRef = useRef<Point | null>(null);
+	/** Objects the current stroke clipped, settled when the stroke ends. */
+	const eraseTouchedRef = useRef<Set<FabricObject>>(new Set());
+	/** Live stroke finaliser, so a tool switch cannot abandon a half stroke. */
+	const finishEraseStrokeRef = useRef<(() => void) | null>(null);
+	/** Where every object sat before the drag, so linked parts move as one. */
+	const dragSeedsRef = useRef(
+		new Map<FabricObject, { left: number; top: number }>(),
+	);
 
-		const toolRef = useRef(tool);
-		toolRef.current = tool;
-		const strokeColorRef = useRef(strokeColor);
-		strokeColorRef.current = strokeColor;
-		const fillColorRef = useRef(fillColor);
-		fillColorRef.current = fillColor;
-		const strokeWidthRef = useRef(strokeWidth);
-		strokeWidthRef.current = strokeWidth;
-		const fontFamilyRef = useRef(fontFamily);
-		fontFamilyRef.current = fontFamily;
+	const toolRef = useRef(tool);
+	toolRef.current = tool;
+	const strokeColorRef = useRef(strokeColor);
+	strokeColorRef.current = strokeColor;
+	const fillColorRef = useRef(fillColor);
+	fillColorRef.current = fillColor;
+	const strokeWidthRef = useRef(strokeWidth);
+	strokeWidthRef.current = strokeWidth;
+	const eraserSizeRef = useRef(eraserSize);
+	eraserSizeRef.current = eraserSize;
+	const fontFamilyRef = useRef(fontFamily);
+	fontFamilyRef.current = fontFamily;
 		const fontBoldRef = useRef(fontBold);
 		fontBoldRef.current = fontBold;
 		const fontItalicRef = useRef(fontItalic);
@@ -142,40 +136,154 @@ const FabricCanvas = forwardRef<FabricCanvasAPI, FabricCanvasProps>(
 		onHistoryChangeRef.current = onHistoryChange;
 		const onToolChangeRef = useRef(onToolChange);
 		onToolChangeRef.current = onToolChange;
-		/** Last known position per linked part set, for dragging parts together. */
-		const lastPosRef = useRef(new Map<string, { left: number; top: number }>());
+		/** Tool the handlers were last bound for, to detect real switches. */
+		const lastToolRef = useRef<Tool | null>(null);
+
 		const selectAfterCreate = useCallback(() => {
 			onToolChangeRef.current?.("select");
 		}, []);
 
-		const forceSaveRef = useRef(() => {});
-		forceSaveRef.current = useCallback(() => {
-			const canvas = fabricRef.current;
-			if (!canvas || isLoadingRef.current) return;
-			const json = snapshotCanvas(canvas);
-			historyRef.current.push(json);
-			redoStackRef.current = [];
-			if (historyRef.current.length > 50) historyRef.current.shift();
-			onHistoryChangeRef.current?.(historyRef.current.length > 1, false);
-			onChangeRef.current?.();
+		const notifyHistory = useCallback(() => {
+			onHistoryChangeRef.current?.(
+				canUndo(historyRef.current),
+				canRedo(historyRef.current),
+			);
 		}, []);
 
-		const saveHistory = useCallback(() => {
-			const canvas = fabricRef.current;
-			if (!canvas || isLoadingRef.current) return;
-			const json = snapshotCanvas(canvas);
-			historyRef.current.push(json);
-			redoStackRef.current = [];
-			if (historyRef.current.length > 50) historyRef.current.shift();
-			onHistoryChangeRef.current?.(historyRef.current.length > 1, false);
+		const debouncedSaveRef = useRef<ReturnType<typeof setTimeout> | null>(
+			null,
+		);
+
+		/** Drop a queued coalesced commit without recording it. */
+		const cancelPendingSave = useCallback(() => {
+			if (debouncedSaveRef.current) {
+				clearTimeout(debouncedSaveRef.current);
+				debouncedSaveRef.current = null;
+			}
 		}, []);
 
-		const debouncedSaveRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+		/**
+		 * Push the current canvas onto the undo stack. The single
+		 * save path, so drawing, modifying, undo, redo and clear can
+		 * never record history differently.
+		 */
+		const commitSnapshot = useCallback(
+			(notifyChange = false) => {
+				// An immediate commit supersedes the queued one; without this a
+				// drag would record a duplicate snapshot whose undo looks dead.
+				cancelPendingSave();
+				const canvas = fabricRef.current;
+				if (!canvas || isLoadingRef.current) return;
+				pushHistory(historyRef.current, snapshotCanvas(canvas));
+				notifyHistory();
+				if (notifyChange) onChangeRef.current?.();
+			},
+			[cancelPendingSave, notifyHistory],
+		);
+
 		const debouncedSave = useCallback(() => {
 			if (debouncedSaveRef.current) clearTimeout(debouncedSaveRef.current);
 			debouncedSaveRef.current = setTimeout(() => {
-				forceSaveRef.current();
-			}, 300);
+				debouncedSaveRef.current = null;
+				commitSnapshot(true);
+			}, HISTORY_DEBOUNCE_MS);
+		}, [commitSnapshot]);
+
+		/** Record a queued edit right now (undo/redo/load must see it). */
+		const flushPendingSave = useCallback(() => {
+			if (!debouncedSaveRef.current) return;
+			cancelPendingSave();
+			commitSnapshot(true);
+		}, [cancelPendingSave, commitSnapshot]);
+
+		/** Leave live text editing, which re-flows while its object changes. */
+		const stopEditing = useCallback(() => {
+			const canvas = fabricRef.current;
+			if (!canvas) return;
+			for (const object of canvas.getObjects()) {
+				const record = object as unknown as {
+					isEditing?: boolean;
+					exitEditing?: () => void;
+				};
+				if (record.isEditing && record.exitEditing) record.exitEditing();
+			}
+		}, []);
+
+		/** Undo the world cursor, which shape tools turn into crosshairs. */
+		const resetCursorToSelect = () => {
+			const canvas = fabricRef.current;
+			if (!canvas) return;
+			canvas.defaultCursor = "default";
+			canvas.hoverCursor = "move";
+		};
+
+		/**
+		 * Drop a shape that is still being dragged out. Handlers are torn
+		 * down on every tool switch, so without this a mid-drag switch would
+		 * strand an unselectable half shape on the canvas forever.
+		 */
+		const abortShapeDraft = useCallback(() => {
+			const canvas = fabricRef.current;
+			const parts: FabricObject[] = [];
+			if (drawingShapeRef.current) parts.push(drawingShapeRef.current);
+			if (arrowHeadRef.current) parts.push(arrowHeadRef.current);
+			if (canvas && parts.length > 0) {
+				canvas.remove(...parts);
+				canvas.renderAll();
+			}
+			drawingShapeRef.current = null;
+			arrowHeadRef.current = null;
+			shapeStartRef.current = null;
+		}, []);
+
+		/**
+		 * Common mouse-up for shape drafts: accidental clicks are dropped
+		 * without a history entry (a duplicate snapshot would make the next
+		 * undo appear to do nothing), real shapes become the selection.
+		 */
+		const endShapeDraft = (acceptable: boolean) => {
+			const canvas = fabricRef.current;
+			const obj = drawingShapeRef.current;
+			drawingShapeRef.current = null;
+			arrowHeadRef.current = null;
+			shapeStartRef.current = null;
+			if (!canvas || !obj) return;
+			canvas.selection = false;
+			resetCursorToSelect();
+			// The page swapped underneath the drag; the load owns the canvas now.
+			if (isLoadingRef.current) return;
+			if (acceptable) {
+				obj.set({ selectable: true });
+				applyControlStyle(obj);
+				canvas.setActiveObject(obj);
+				debouncedSave();
+				onChangeRef.current?.();
+			} else {
+				canvas.remove(obj);
+			}
+			selectAfterCreate();
+			canvas.renderAll();
+		};
+
+		const resetDragTracking = useCallback(() => {
+			dragSeedsRef.current.clear();
+		}, []);
+
+		/**
+		 * Snapshot where everything sits just before a drag starts. Linked
+		 * parts then move as exact offsets of this baseline — re-seeded on
+		 * every press — instead of chasing each other's previous position,
+		 * which used to drift after undo and jump sticky text off its note.
+		 */
+		const seedDragPositions = useCallback((canvas: Canvas) => {
+			const seeds = new Map<FabricObject, { left: number; top: number }>();
+			for (const object of canvas.getObjects()) {
+				seeds.set(object, {
+					left: object.left ?? 0,
+					top: object.top ?? 0,
+				});
+			}
+			dragSeedsRef.current = seeds;
 		}, []);
 
 		const waitForFonts = useCallback(async (): Promise<boolean> => {
@@ -200,190 +308,136 @@ const FabricCanvas = forwardRef<FabricCanvasAPI, FabricCanvasProps>(
 		useImperativeHandle(ref, () => ({
 			getJSON: () =>
 				fabricRef.current ? canvasToJSON(fabricRef.current) : {},
-		loadJSON: async (json) => {
+		undo: () => {
 			const canvas = fabricRef.current;
-			if (!canvas) return;
+			if (!canvas || isLoadingRef.current) return;
+			// Settle whatever is mid-flight: an erase stroke or a half shape
+			// predates this undo, and a queued commit must not land after it.
+			finishEraseStrokeRef.current?.();
+			abortShapeDraft();
+			flushPendingSave();
+			const previous = undoHistory(historyRef.current);
+			if (previous === null) return;
 			isLoadingRef.current = true;
-			historyRef.current = [];
-			redoStackRef.current = [];
-			try {
-				await canvas.loadFromJSON(json);
-				canvas.backgroundColor = darkMode ? "#1a1a1a" : "#ffffff";
-				canvas.renderAll();
-				styleCanvasObjects(canvas);
-				migrateAndWireStickies(canvas);
-				migrateLegacyArrows(canvas);
-				resetDragTracking();
-				historyRef.current.push(snapshotCanvas(canvas));
-			} finally {
-				isLoadingRef.current = false;
-			}
-			onHistoryChangeRef.current?.(false, false);
+			canvas
+				.loadFromJSON(previous)
+				.then(() => {
+					normalizeLoadedCanvas(canvas);
+					resetDragTracking();
+					isLoadingRef.current = false;
+					onChangeRef.current?.();
+					notifyHistory();
+				})
+				.catch(() => {
+					isLoadingRef.current = false;
+				});
 		},
-			undo: () => {
-				const canvas = fabricRef.current;
-				if (!canvas || historyRef.current.length <= 1) return;
-				const current = historyRef.current.pop();
-				if (!current) return;
-				redoStackRef.current.push(current);
-				const prev = historyRef.current[historyRef.current.length - 1];
-				isLoadingRef.current = true;
-				canvas.loadFromJSON(prev)
-					.then(() => {
-						canvas.renderAll();
-						styleCanvasObjects(canvas);
-						migrateAndWireStickies(canvas);
-						migrateLegacyArrows(canvas);
-						resetDragTracking();
-						isLoadingRef.current = false;
-						onChangeRef.current?.();
-						onHistoryChangeRef.current?.(
-							historyRef.current.length > 1,
-							redoStackRef.current.length > 0,
-						);
-					})
-					.catch(() => {
-						isLoadingRef.current = false;
-					});
-			},
-			redo: () => {
-				const canvas = fabricRef.current;
-				if (!canvas || redoStackRef.current.length === 0) return;
-				const next = redoStackRef.current.pop();
-				if (!next) return;
-				historyRef.current.push(next);
-				isLoadingRef.current = true;
-				canvas.loadFromJSON(next)
-					.then(() => {
-						canvas.renderAll();
-						styleCanvasObjects(canvas);
-						migrateAndWireStickies(canvas);
-						migrateLegacyArrows(canvas);
-						resetDragTracking();
-						isLoadingRef.current = false;
-						onChangeRef.current?.();
-						onHistoryChangeRef.current?.(
-							historyRef.current.length > 1,
-							redoStackRef.current.length > 0,
-						);
-					})
-					.catch(() => {
-						isLoadingRef.current = false;
-					});
-			},
-			canUndo: () => historyRef.current.length > 1,
-			canRedo: () => redoStackRef.current.length > 0,
+		redo: () => {
+			const canvas = fabricRef.current;
+			if (!canvas || isLoadingRef.current) return;
+			finishEraseStrokeRef.current?.();
+			abortShapeDraft();
+			flushPendingSave();
+			const next = redoHistory(historyRef.current);
+			if (next === null) return;
+			isLoadingRef.current = true;
+			canvas
+				.loadFromJSON(next)
+				.then(() => {
+					normalizeLoadedCanvas(canvas);
+					resetDragTracking();
+					isLoadingRef.current = false;
+					onChangeRef.current?.();
+					notifyHistory();
+				})
+				.catch(() => {
+					isLoadingRef.current = false;
+				});
+		},
 		clear: () => {
 			const canvas = fabricRef.current;
-			if (!canvas) return;
+			if (!canvas || isLoadingRef.current) return;
+			finishEraseStrokeRef.current?.();
+			abortShapeDraft();
+			flushPendingSave();
 			canvas.clear();
-			canvas.backgroundColor = darkMode ? "#1a1a1a" : "#ffffff";
+			canvas.backgroundColor = backgroundFor(darkMode);
 			canvas.renderAll();
-			saveHistory();
-			onChangeRef.current?.();
+			commitSnapshot(true);
 		},
-			forceSave: () => {
-				const canvas = fabricRef.current;
-				if (!canvas || isLoadingRef.current) return;
-				const json = snapshotCanvas(canvas);
-				historyRef.current.push(json);
-				redoStackRef.current = [];
-				if (historyRef.current.length > 50) historyRef.current.shift();
-				onHistoryChangeRef.current?.(historyRef.current.length > 1, false);
-				onChangeRef.current?.();
-			},
-			flushEditing: () => {
-				const canvas = fabricRef.current;
-				if (!canvas) return;
-				for (const o of canvas.getObjects()) {
-					const rec = o as unknown as {
-						isEditing?: boolean;
-						exitEditing?: () => void;
-					};
-					if (rec.isEditing && rec.exitEditing) rec.exitEditing();
+		deleteSelection: () => {
+			const canvas = fabricRef.current;
+			if (!canvas || isLoadingRef.current) return;
+			const active = canvas.getActiveObjects();
+			if (active.length === 0) return;
+			stopEditing();
+			// Deleting one part must delete its whole linked construct, or an
+			// arrow head or sticky background would be left stranded behind.
+			const links = new Set(
+				active
+					.map(linkIdOf)
+					.filter((id): id is string => id !== undefined),
+			);
+			const doomed = new Set<FabricObject>(active);
+			if (links.size > 0) {
+				for (const object of canvas.getObjects()) {
+					const id = linkIdOf(object);
+					if (id !== undefined && links.has(id)) doomed.add(object);
 				}
-			},
+			}
+			canvas.discardActiveObject();
+			canvas.remove(...doomed);
+			canvas.renderAll();
+			commitSnapshot(true);
+		},
+		flushEditing: () => {
+			stopEditing();
+		},
 			isLoading: () => isLoadingRef.current,
 			snapshotImage: () => {
 				const canvas = fabricRef.current;
 				if (!canvas) return null;
+				// Arrow dots are selection UI; keep them out of the export but
+				// restore the user's selection afterwards.
+				const selected = canvas.getActiveObjects();
+				syncArrowHandleVisibility(canvas, []);
 				try {
 					return canvas.toDataURL({ format: "png", multiplier: 2 });
 				} catch {
 					return null;
+				} finally {
+					syncArrowHandleVisibility(canvas, selected);
 				}
 			},
 		capturePage: async (json) => {
 			const canvas = fabricRef.current;
-			if (!canvas) return null;
+			if (!canvas || isLoadingRef.current) return null;
+			// A commit queued right now would be swallowed by the load below.
+			flushPendingSave();
 			const prevSnapshot = snapshotCanvas(canvas);
-			const prevHistory = [...historyRef.current];
-			const prevRedo = [...redoStackRef.current];
+			const prevHistory = [...historyRef.current.undoStack];
+			const prevRedo = [...historyRef.current.redoStack];
 			isLoadingRef.current = true;
 			try {
 				await canvas.loadFromJSON(json);
-				canvas.renderAll();
+				normalizeLoadedCanvas(canvas);
 				return canvas.toDataURL({ format: "png", multiplier: 2 });
 			} catch {
 				return null;
 			} finally {
 				try {
 					await canvas.loadFromJSON(JSON.parse(prevSnapshot));
-					canvas.renderAll();
+					normalizeLoadedCanvas(canvas);
 				} finally {
 					isLoadingRef.current = false;
 				}
-				historyRef.current = prevHistory;
-				redoStackRef.current = prevRedo;
-				onHistoryChangeRef.current?.(
-					prevHistory.length > 1,
-					prevRedo.length > 0,
-				);
+				historyRef.current.undoStack = prevHistory;
+				historyRef.current.redoStack = prevRedo;
+				notifyHistory();
 			}
 		},
 		getCanvasElement: () => canvasElRef.current,
 	}));
-
-		const resetDragTracking = useCallback(() => {
-			lastPosRef.current.clear();
-		}, []);
-
-		const syncHandleVisibility = useCallback((selected?: FabricObject[]) => {
-			const canvas = fabricRef.current;
-			if (!canvas) return;
-			const ids = new Set<string>();
-			const collect = (o?: FabricObject) => {
-				if (!o) return;
-				const r = o as unknown as Record<string, unknown>;
-				if (typeof r["arrowId"] === "string") ids.add(r["arrowId"] as string);
-				const kids =
-					(o as unknown as { getObjects?: () => FabricObject[] }).getObjects?.() ??
-					[];
-				for (const k of kids) {
-					const kr = k as unknown as Record<string, unknown>;
-					if (typeof kr["arrowId"] === "string")
-						ids.add(kr["arrowId"] as string);
-				}
-			};
-			for (const o of selected ?? []) collect(o);
-			let changed = false;
-			for (const o of canvas.getObjects()) {
-				const r = o as unknown as Record<string, unknown>;
-				const link =
-					(r["handleFor"] ??
-					(r["pointIndex"] != null ? r["arrowId"] : undefined)) as
-					| string
-					| undefined;
-				if (typeof link === "string") {
-					const vis = ids.has(link);
-					if (((o as FabricObject).visible ?? true) !== vis) {
-						o.set({ visible: vis });
-						changed = true;
-					}
-				}
-			}
-			if (changed) canvas.renderAll();
-		}, []);
 
 		const handleObjectMoving = useCallback(
 			(opt: { target?: FabricObject; e: Event }) => {
@@ -406,39 +460,27 @@ const FabricCanvas = forwardRef<FabricCanvasAPI, FabricCanvasProps>(
 					return;
 				}
 
-				// Linked parts (arrow shafts, sticky bg/text): drag them together.
-				const linkId = (rec["arrowId"] ?? rec["stickyPart"]) as
-					| string
-					| undefined;
-				if (!linkId || rec["isSticky"] === true) return;
-				const key = `link:${linkId}`;
-				const cur = {
-					left: (target as FabricObject).left ?? 0,
-					top: (target as FabricObject).top ?? 0,
-				};
-				const last = lastPosRef.current.get(key);
-				if (last) {
-					const dx = cur.left - last.left;
-					const dy = cur.top - last.top;
-					if (dx !== 0 || dy !== 0) {
-						for (const o of canvas.getObjects()) {
-							if (o === target) continue;
-							const r = o as unknown as Record<string, unknown>;
-							if (
-								r["arrowId"] === linkId ||
-								r["stickyPart"] === linkId ||
-								r["handleFor"] === linkId
-							) {
-								o.set({
-									left: (o.left ?? 0) + dx,
-									top: (o.top ?? 0) + dy,
-								});
-								o.setCoords();
-							}
-						}
-					}
+				// Linked parts (arrow shaft/head/dots, sticky bg/text) move by
+				// the dragged object's delta from its own pre-drag position.
+				const linkId = linkIdOf(target);
+				if (!linkId) return;
+				const seeds = dragSeedsRef.current;
+				const targetSeed = seeds.get(target);
+				if (!targetSeed) return;
+				const dx = (target.left ?? 0) - targetSeed.left;
+				const dy = (target.top ?? 0) - targetSeed.top;
+				if (dx === 0 && dy === 0) return;
+				for (const object of canvas.getObjects()) {
+					if (object === target) continue;
+					if (linkIdOf(object) !== linkId) continue;
+					const seed = seeds.get(object);
+					if (!seed) continue;
+					object.set({
+						left: seed.left + dx,
+						top: seed.top + dy,
+					});
+					object.setCoords();
 				}
-				lastPosRef.current.set(key, cur);
 			},
 			[debouncedSave],
 		);
@@ -446,8 +488,8 @@ const FabricCanvas = forwardRef<FabricCanvasAPI, FabricCanvasProps>(
 		const handleObjectModified = useCallback(() => {
 			// All part coordinates are absolute, so a transform only needs saving.
 			if (!fabricRef.current || isLoadingRef.current) return;
-			forceSaveRef.current();
-		}, []);
+			commitSnapshot(true);
+		}, [commitSnapshot]);
 
 		const handleStickyDblClick = useCallback(
 			(opt: { target?: FabricObject }) => {
@@ -480,7 +522,7 @@ const FabricCanvas = forwardRef<FabricCanvasAPI, FabricCanvasProps>(
 		const canvas = new Canvas(canvasElRef.current, {
 			width: w,
 			height: h,
-			backgroundColor: darkMode ? "#1a1a1a" : "#ffffff",
+			backgroundColor: backgroundFor(darkMode),
 			selection: true,
 		});
 			fabricRef.current = canvas;
@@ -498,26 +540,33 @@ const FabricCanvas = forwardRef<FabricCanvasAPI, FabricCanvasProps>(
 			canvas.on("object:modified", handleObjectModified);
 			canvas.on("mouse:dblclick", handleStickyDblClick);
 			canvas.on("selection:created", (opt) =>
-				syncHandleVisibility(opt.selected),
+				syncArrowHandleVisibility(canvas, opt.selected),
 			);
 			canvas.on("selection:updated", (opt) =>
-				syncHandleVisibility(opt.selected),
+				syncArrowHandleVisibility(canvas, opt.selected),
 			);
-			canvas.on("selection:cleared", () => syncHandleVisibility(undefined));
-			saveHistory();
+			canvas.on("selection:cleared", () =>
+				syncArrowHandleVisibility(canvas),
+			);
+			commitSnapshot(false);
 			initializedRef.current = true;
 			return () => {
+				// A queued commit would fire against a disposed canvas.
+				cancelPendingSave();
 				resizeObserver.disconnect();
 				canvas.dispose();
 				fabricRef.current = null;
 				initializedRef.current = false;
 			};
+		// The canvas is created once and torn down once; the handlers read
+		// live values through refs, so re-running on prop changes is wrong.
+		// eslint-disable-next-line react-hooks/exhaustive-deps
 		}, []);
 
 		useEffect(() => {
 			const canvas = fabricRef.current;
 			if (!canvas || !initializedRef.current) return;
-			canvas.backgroundColor = darkMode ? "#1a1a1a" : "#ffffff";
+			canvas.backgroundColor = backgroundFor(darkMode);
 			canvas.renderAll();
 		}, [darkMode]);
 
@@ -530,512 +579,101 @@ const FabricCanvas = forwardRef<FabricCanvasAPI, FabricCanvasProps>(
 
 			if (pageKey !== lastLoadedPageKeyRef.current) {
 				lastLoadedPageKeyRef.current = pageKey ?? 0;
+				// Settle anything in flight before the canvas is swapped out.
+				finishEraseStrokeRef.current?.();
+				abortShapeDraft();
+				cancelPendingSave();
 				resetDragTracking();
 				canvas.discardActiveObject();
 				if (hasData) {
 					isLoadingRef.current = true;
-					historyRef.current = [];
-					redoStackRef.current = [];
+					resetHistory(historyRef.current);
 					canvas.loadFromJSON(pageJson)
 						.then(() => {
-							canvas.renderAll();
-							styleCanvasObjects(canvas);
-							migrateAndWireStickies(canvas);
-						migrateLegacyArrows(canvas);
-							historyRef.current.push(snapshotCanvas(canvas));
+							normalizeLoadedCanvas(canvas);
+							pushHistory(
+								historyRef.current,
+								snapshotCanvas(canvas),
+							);
 							isLoadingRef.current = false;
-							onHistoryChangeRef.current?.(false, false);
+							notifyHistory();
 						})
 						.catch(() => {
 							isLoadingRef.current = false;
 						});
-			} else {
-				canvas.clear();
-				canvas.backgroundColor = darkMode ? "#1a1a1a" : "#ffffff";
-				canvas.renderAll();
-				historyRef.current = [];
-				redoStackRef.current = [];
-				historyRef.current.push(snapshotCanvas(canvas));
-				onHistoryChangeRef.current?.(false, false);
+	} else {
+			canvas.clear();
+			canvas.backgroundColor = backgroundFor(darkMode);
+			canvas.renderAll();
+			resetHistory(historyRef.current);
+				pushHistory(historyRef.current, snapshotCanvas(canvas));
+				notifyHistory();
 			}
 			}
+		// Loading a page is driven purely by pageJson and pageKey; darkMode
+		// has its own effect and resetDragTracking only clears a cache.
+		// eslint-disable-next-line react-hooks/exhaustive-deps
 		}, [pageJson, pageKey]);
-
-		const resetCursorToSelect = () => {
-			const canvas = fabricRef.current;
-			if (!canvas) return;
-			canvas.defaultCursor = "default";
-			canvas.hoverCursor = "move";
-		};
 
 		// biome-ignore lint/correctness/useExhaustiveDependencies: refs handle updates
 		useEffect(() => {
 			const canvas = fabricRef.current;
 			if (!canvas || !initializedRef.current) return;
 
-			const currentTool = toolRef.current;
-			const currentStrokeColor = strokeColorRef.current;
-			const currentFillColor = fillColorRef.current;
-			const currentStrokeWidth = strokeWidthRef.current;
+			// A tool switch (or colour change) while the nib is down ends the
+			// stroke first, so its erased objects and undo entry are settled
+			// before the handlers they belong to are torn down.
+			finishEraseStrokeRef.current?.();
 
-			canvas.isDrawingMode = false;
-			canvas.selection = true;
-			canvas.defaultCursor = "default";
-			canvas.hoverCursor = "default";
-			canvas.off("mouse:down");
-			canvas.off("mouse:move");
-			canvas.off("mouse:up");
-			canvas.off("path:created");
-
-			if (!isDrawingRef.current && drawingShapeRef.current) {
-				canvas.remove(drawingShapeRef.current);
-				drawingShapeRef.current = null;
-			}
-			if (!isDrawingRef.current && arrowHeadRef.current) {
-				canvas.remove(arrowHeadRef.current);
-				arrowHeadRef.current = null;
-			}
-			shapeStartRef.current = null;
-
-			switch (currentTool) {
-				case "select": {
-					canvas.selection = true;
-					canvas.defaultCursor = "default";
-					canvas.hoverCursor = "move";
-					break;
-				}
-				case "draw": {
-					canvas.isDrawingMode = true;
-					canvas.selection = false;
-					const brush = new PencilBrush(canvas);
-					brush.color = currentStrokeColor;
-					brush.width = currentStrokeWidth;
-					canvas.freeDrawingBrush = brush;
-					canvas.on("path:created", (e) => {
-						const path = (e as unknown as { path?: FabricObject }).path;
-						if (path) applyControlStyle(path);
-						debouncedSave();
-						onChangeRef.current?.();
-					});
-					break;
-				}
-				case "highlighter": {
-					canvas.isDrawingMode = true;
-					canvas.selection = false;
-					const brush = new PencilBrush(canvas);
-					brush.color = hexToRgba(currentStrokeColor, 0.35);
-					brush.width = Math.max(currentStrokeWidth * 3, 10);
-					brush.strokeLineCap = "round";
-					brush.strokeLineJoin = "round";
-					canvas.freeDrawingBrush = brush;
-					canvas.on("path:created", (e) => {
-						const path = (
-							e as unknown as { path?: FabricObject }
-						).path;
-						if (path) {
-							path.set({
-								selectable: true,
-								evented: true,
-								globalCompositeOperation: "multiply",
-							});
-							applyControlStyle(path);
-							canvas.renderAll();
-						}
-						debouncedSave();
-						onChangeRef.current?.();
-					});
-					break;
-				}
-			case "rect": {
-				canvas.selection = false;
-				canvas.defaultCursor = "crosshair";
-				canvas.on("mouse:down", (opt) => {
-					const pointer = canvas.getScenePoint(opt.e);
-						shapeStartRef.current = { x: pointer.x, y: pointer.y };
-						isDrawingRef.current = true;
-						const rect = new Rect({
-							left: pointer.x,
-							top: pointer.y,
-							width: 0,
-							height: 0,
-							fill:
-								currentFillColor === "transparent"
-									? ""
-									: currentFillColor,
-							stroke: currentStrokeColor,
-							strokeWidth: currentStrokeWidth,
-							selectable: false,
-							originX: "left",
-							originY: "top",
-						});
-						canvas.add(rect);
-						drawingShapeRef.current = rect;
-					});
-					canvas.on("mouse:move", (opt) => {
-						if (!shapeStartRef.current || !drawingShapeRef.current) return;
-						const pointer = canvas.getScenePoint(opt.e);
-						const startX = shapeStartRef.current.x;
-						const startY = shapeStartRef.current.y;
-						const rect = drawingShapeRef.current as Rect;
-						const w = pointer.x - startX;
-						const h = pointer.y - startY;
-						rect.set({
-							left: w < 0 ? pointer.x : startX,
-							top: h < 0 ? pointer.y : startY,
-							width: Math.abs(w),
-							height: Math.abs(h),
-						});
-						canvas.renderAll();
-					});
-					canvas.on("mouse:up", () => {
-						if (drawingShapeRef.current) {
-							const obj = drawingShapeRef.current;
-							const w = obj.width ?? 0;
-							const h = obj.height ?? 0;
-							if (w < MIN_SHAPE_SIZE && h < MIN_SHAPE_SIZE) {
-								canvas.remove(obj);
-							} else {
-								obj.set({ selectable: true });
-								applyControlStyle(obj);
-								canvas.setActiveObject(obj);
-							}
-							drawingShapeRef.current = null;
-							shapeStartRef.current = null;
-							isDrawingRef.current = false;
-							canvas.selection = false;
-							resetCursorToSelect();
-							debouncedSave();
-							onChangeRef.current?.();
-							selectAfterCreate();
-						}
-					});
-					break;
-				}
-			case "circle": {
-				canvas.selection = false;
-				canvas.defaultCursor = "crosshair";
-				canvas.on("mouse:down", (opt) => {
-					const pointer = canvas.getScenePoint(opt.e);
-						shapeStartRef.current = { x: pointer.x, y: pointer.y };
-						isDrawingRef.current = true;
-						const circle = new Circle({
-							left: pointer.x,
-							top: pointer.y,
-							radius: 0,
-							fill:
-								currentFillColor === "transparent"
-									? ""
-									: currentFillColor,
-							stroke: currentStrokeColor,
-							strokeWidth: currentStrokeWidth,
-							selectable: false,
-							originX: "left",
-							originY: "top",
-						});
-						canvas.add(circle);
-						drawingShapeRef.current = circle;
-					});
-					canvas.on("mouse:move", (opt) => {
-						if (!shapeStartRef.current || !drawingShapeRef.current) return;
-						const pointer = canvas.getScenePoint(opt.e);
-						const startX = shapeStartRef.current.x;
-						const startY = shapeStartRef.current.y;
-						const radius =
-							Math.sqrt(
-								(pointer.x - startX) ** 2 +
-									(pointer.y - startY) ** 2,
-							) / 2;
-						const circle = drawingShapeRef.current as Circle;
-						circle.set({
-							left: Math.min(startX, pointer.x),
-							top: Math.min(startY, pointer.y),
-							radius,
-						});
-						canvas.renderAll();
-					});
-					canvas.on("mouse:up", () => {
-						if (drawingShapeRef.current) {
-							const obj = drawingShapeRef.current;
-							const r = (obj as Circle).radius ?? 0;
-							if (r < MIN_SHAPE_SIZE / 2) {
-								canvas.remove(obj);
-							} else {
-								obj.set({ selectable: true });
-								applyControlStyle(obj);
-								canvas.setActiveObject(obj);
-							}
-							drawingShapeRef.current = null;
-							shapeStartRef.current = null;
-							isDrawingRef.current = false;
-							canvas.selection = false;
-							resetCursorToSelect();
-							debouncedSave();
-							onChangeRef.current?.();
-							selectAfterCreate();
-						}
-					});
-					break;
-				}
-			case "line": {
-				canvas.selection = false;
-				canvas.defaultCursor = "crosshair";
-				canvas.on("mouse:down", (opt) => {
-					const pointer = canvas.getScenePoint(opt.e);
-						shapeStartRef.current = { x: pointer.x, y: pointer.y };
-						isDrawingRef.current = true;
-						const line = new Line(
-							[pointer.x, pointer.y, pointer.x, pointer.y],
-							{
-								stroke: currentStrokeColor,
-								strokeWidth: currentStrokeWidth,
-								selectable: false,
-							},
-						);
-						canvas.add(line);
-						drawingShapeRef.current = line;
-					});
-					canvas.on("mouse:move", (opt) => {
-						if (!shapeStartRef.current || !drawingShapeRef.current) return;
-						const pointer = canvas.getScenePoint(opt.e);
-						const line = drawingShapeRef.current as Line;
-						line.set({ x2: pointer.x, y2: pointer.y });
-						canvas.renderAll();
-					});
-					canvas.on("mouse:up", () => {
-						if (drawingShapeRef.current) {
-							const obj = drawingShapeRef.current;
-							const line = obj as Line;
-							const dx = (line.x2 ?? 0) - (line.x1 ?? 0);
-							const dy = (line.y2 ?? 0) - (line.y1 ?? 0);
-							if (Math.sqrt(dx * dx + dy * dy) < MIN_SHAPE_SIZE) {
-								canvas.remove(obj);
-							} else {
-								obj.set({ selectable: true });
-								applyControlStyle(obj);
-								canvas.setActiveObject(obj);
-							}
-							drawingShapeRef.current = null;
-							shapeStartRef.current = null;
-							isDrawingRef.current = false;
-							canvas.selection = false;
-							resetCursorToSelect();
-							debouncedSave();
-							onChangeRef.current?.();
-							selectAfterCreate();
-						}
-					});
-					break;
-				}
-			case "arrow": {
-				canvas.selection = false;
-				canvas.defaultCursor = "crosshair";
-				canvas.on("mouse:down", (opt) => {
-					const pointer = canvas.getScenePoint(opt.e);
-						shapeStartRef.current = { x: pointer.x, y: pointer.y };
-						isDrawingRef.current = true;
-						const line = new Line(
-							[pointer.x, pointer.y, pointer.x, pointer.y],
-							{
-								stroke: currentStrokeColor,
-								strokeWidth: currentStrokeWidth,
-								selectable: false,
-								evented: false,
-							},
-						);
-						const headSize = 10 + currentStrokeWidth * 2;
-						const head = new Triangle({
-							left: pointer.x,
-							top: pointer.y,
-							width: headSize,
-							height: headSize,
-							fill: currentStrokeColor,
-							selectable: false,
-							evented: false,
-							originX: "center",
-							originY: "center",
-						});
-						canvas.add(line, head);
-						drawingShapeRef.current = line;
-						arrowHeadRef.current = head;
-					});
-					canvas.on("mouse:move", (opt) => {
-						if (!shapeStartRef.current || !drawingShapeRef.current) return;
-						const header = arrowHeadRef.current as Triangle | null;
-						if (!header) return;
-						const pointer = canvas.getScenePoint(opt.e);
-						const line = drawingShapeRef.current as Line;
-						line.set({ x2: pointer.x, y2: pointer.y });
-						const startX = shapeStartRef.current.x;
-						const startY = shapeStartRef.current.y;
-						placeHead(
-							header,
-							pointer.x,
-							pointer.y,
-							startX,
-							startY,
-							10 + currentStrokeWidth * 2,
-						);
-						canvas.renderAll();
-					});
-					canvas.on("mouse:up", () => {
-						const lineObj = drawingShapeRef.current as Line | null;
-						const headObj = arrowHeadRef.current as Triangle | null;
-						drawingShapeRef.current = null;
-						arrowHeadRef.current = null;
-						shapeStartRef.current = null;
-						isDrawingRef.current = false;
-						if (lineObj && headObj) {
-							const x1 = lineObj.x1 ?? 0;
-							const y1 = lineObj.y1 ?? 0;
-							const x2 = lineObj.x2 ?? 0;
-							const y2 = lineObj.y2 ?? 0;
-							const dx = x2 - x1;
-							const dy = y2 - y1;
-							canvas.remove(lineObj, headObj);
-							if (Math.sqrt(dx * dx + dy * dy) >= MIN_SHAPE_SIZE) {
-								const arrowId = uid();
-								const { shaft, head, dots } = createArrowParts(
-									{ x1, y1, x2, y2, bend: 0 },
-									{
-										stroke: currentStrokeColor,
-										strokeWidth: currentStrokeWidth,
-									},
-									arrowId,
-								);
-								canvas.add(shaft, head, ...dots);
-								for (const d of dots) {
-									d.set({ visible: true });
-									canvas.bringObjectToFront(d);
-								}
-								canvas.setActiveObject(shaft);
-								lastPosRef.current.set(`link:${arrowId}`, {
-									left: shaft.left ?? 0,
-									top: shaft.top ?? 0,
-								});
-							}
-							canvas.selection = false;
-							resetCursorToSelect();
-							debouncedSave();
-							onChangeRef.current?.();
-							selectAfterCreate();
-						}
-					});
-					break;
-				}
-			case "text": {
-				canvas.selection = false;
-				canvas.defaultCursor = "text";
-				canvas.on("mouse:down", async (opt) => {
-					await waitForFonts();
-						const pointer = canvas.getScenePoint(opt.e);
-						const text = new Textbox("Text", {
-							left: pointer.x,
-							top: pointer.y,
-							fontSize: 16,
-							fontFamily: fontFamilyRef.current ?? "Inter",
-							fill: currentStrokeColor,
-							width: 200,
-							editable: true,
-							originX: "left",
-							originY: "top",
-							fontWeight: fontBoldRef.current
-								? "bold"
-								: "normal",
-							fontStyle: fontItalicRef.current
-								? "italic"
-								: "normal",
-							underline: fontUnderlineRef.current ?? false,
-						});
-						canvas.add(text);
-						canvas.setActiveObject(text);
-						applyControlStyle(text);
-						text.enterEditing();
-						text.selectAll();
-						debouncedSave();
-						onChangeRef.current?.();
-						selectAfterCreate();
-					});
-					break;
-				}
-			case "sticky": {
-				canvas.selection = false;
-				canvas.defaultCursor = "copy";
-				canvas.hoverCursor = "move";
-				canvas.on("mouse:down", async (opt) => {
-					await waitForFonts();
-						const pointer = canvas.getScenePoint(opt.e);
-						const stickyColor =
-							currentFillColor === "transparent"
-								? DEFAULT_STICKY_COLOR
-								: currentFillColor;
-						const { bg, text, id } = createStickyNote(
-							pointer.x,
-							pointer.y,
-							stickyColor,
-							{
-								family: fontFamilyRef.current ?? "Inter",
-								bold: fontBoldRef.current ?? false,
-								italic: fontItalicRef.current ?? false,
-								underline: fontUnderlineRef.current ?? false,
-								color: "#1f2937",
-							},
-						);
-						canvas.add(bg, text);
-						wireStickyGrow(canvas, text, id);
-						canvas.setActiveObject(text);
-						text.enterEditing();
-						text.selectAll();
-						lastPosRef.current.set(`link:${id}`, {
-							left: text.left ?? 0,
-							top: text.top ?? 0,
-						});
-						canvas.renderAll();
-						debouncedSave();
-						onChangeRef.current?.();
-						selectAfterCreate();
-					});
-					break;
-				}
-				case "eraser": {
-					canvas.selection = false;
-					const eraserCursorValue = eraserCursor();
-					canvas.defaultCursor = eraserCursorValue;
-					canvas.hoverCursor = eraserCursorValue;
-					canvas.on("mouse:down", (opt) => {
-						const target = opt.target as unknown as Record<
-							string,
-							unknown
-						> | null;
-						if (!target) return;
-						const toRemove = new Set<FabricObject>([
-							target as unknown as FabricObject,
-						]);
-						const linkId = (target["arrowId"] ??
-							target["handleFor"] ??
-							target["stickyPart"]) as string | undefined;
-						if (linkId) {
-							for (const o of canvas.getObjects()) {
-								const r = o as unknown as Record<string, unknown>;
-								if (
-									r["arrowId"] === linkId ||
-									r["handleFor"] === linkId ||
-									(r["stickyPart"] === linkId && r["isSticky"] !== true)
-								) {
-									toRemove.add(o);
-								}
-							}
-						}
-						for (const obj of toRemove) canvas.remove(obj);
-						canvas.renderAll();
-						debouncedSave();
-						onChangeRef.current?.();
-					});
-					break;
-				}
+			const toolChanged = toolRef.current !== lastToolRef.current;
+			lastToolRef.current = toolRef.current;
+			if (toolChanged) {
+				// The old handlers are about to go, so leave nothing behind:
+				// exit text editing and discard a half-dragged shape.
+				stopEditing();
+				abortShapeDraft();
 			}
 
-			canvas.renderAll();
-		}, [tool, strokeColor, fillColor, strokeWidth, debouncedSave]);
+			// All tool and style values reach the handlers as explicit inputs;
+			// everything else is read live through the refs in this object.
+			rebindTool(
+				canvas,
+				toolRef.current,
+				{
+					strokeColor: strokeColorRef.current,
+					fillColor: fillColorRef.current,
+					strokeWidth: strokeWidthRef.current,
+				},
+				{
+					isLoadingRef,
+					toolRef,
+					shapeStartRef,
+					drawingShapeRef,
+					arrowHeadRef,
+					dragSeedsRef,
+					isErasingRef,
+					lastErasePointRef,
+					eraseTouchedRef,
+					finishEraseStrokeRef,
+					eraserSizeRef,
+					fontFamilyRef,
+					fontBoldRef,
+					fontItalicRef,
+					fontUnderlineRef,
+					onChangeRef,
+					debouncedSave,
+					stopEditing,
+					endShapeDraft,
+					resetCursorToSelect,
+					selectAfterCreate,
+					seedDragPositions,
+					waitForFonts,
+				},
+			);
+		// Font, eraser size and the settle helpers are stable and read
+		// current values via refs, so the props above are the only inputs.
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+		}, [tool, strokeColor, fillColor, strokeWidth, eraserSize, debouncedSave]);
 
 		return (
 			<div ref={containerRef} className="fabric-canvas-container">

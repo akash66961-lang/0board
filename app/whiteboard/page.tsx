@@ -2,13 +2,21 @@
 
 import dynamic from "next/dynamic";
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+	useCallback,
+	useEffect,
+	useMemo,
+	useRef,
+	useState,
+	useSyncExternalStore,
+} from "react";
 import ExportPdf from "../components/ExportPdf";
 import type { FabricCanvasAPI, Tool } from "../components/FabricCanvas";
 import type { Page } from "../components/PageSidebar";
 import PageSidebar from "../components/PageSidebar";
 import RecordingControls from "../components/RecordingControls";
 import Toolbar from "../components/Toolbar";
+import { DEFAULT_ERASER_SIZE, uid } from "../lib/diagramConstants";
 
 const FabricCanvas = dynamic(() => import("../components/FabricCanvas"), {
 	ssr: false,
@@ -21,13 +29,23 @@ const FabricCanvas = dynamic(() => import("../components/FabricCanvas"), {
 
 const STORAGE_KEY = "0board-pages";
 
-function generateId() {
-	return Math.random().toString(36).slice(2, 10);
-}
+/** Single-key tool shortcuts, so the keyboard handler stays a lookup. */
+const TOOL_SHORTCUTS: Record<string, Tool> = {
+	v: "select",
+	d: "draw",
+	h: "highlighter",
+	r: "rect",
+	c: "circle",
+	l: "line",
+	a: "arrow",
+	t: "text",
+	s: "sticky",
+	e: "eraser",
+};
 
 function loadPages(): Page[] {
 	if (typeof window === "undefined")
-		return [{ id: generateId(), name: "Page 1", json: {} }];
+		return [{ id: uid(), name: "Page 1", json: {} }];
 	try {
 		const stored = localStorage.getItem(STORAGE_KEY);
 		if (stored) {
@@ -35,7 +53,7 @@ function loadPages(): Page[] {
 			if (Array.isArray(parsed) && parsed.length > 0) return parsed;
 		}
 	} catch {}
-	return [{ id: generateId(), name: "Page 1", json: {} }];
+	return [{ id: uid(), name: "Page 1", json: {} }];
 }
 
 function savePages(pages: Page[]) {
@@ -44,17 +62,33 @@ function savePages(pages: Page[]) {
 	} catch {}
 }
 
+/**
+ * Hydration is already done when the browser first subscribes, so the store
+ * never changes: the subscribe callback simply reports that the client is live.
+ */
+function subscribeToHydration(onChange: () => void): () => void {
+	onChange();
+	return () => {};
+}
+
 export default function WhiteboardPage() {
-	const [pages, setPages] = useState<Page[]>([]);
+	// Pages come from localStorage, so they are read lazily on the client only.
+	// Rendering nothing until hydration finishes keeps server markup consistent.
+	const hydrated = useSyncExternalStore(
+		subscribeToHydration,
+		() => true,
+		() => false,
+	);
+	const [pages, setPages] = useState<Page[]>(loadPages);
 	const [activePageIndex, setActivePageIndex] = useState(0);
 	const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-	const [loaded, setLoaded] = useState(false);
 	const [pageKey, setPageKey] = useState(0);
 
 	const [activeTool, setActiveTool] = useState<Tool>("select");
 	const [strokeColor, setStrokeColor] = useState("#000000");
 	const [fillColor, setFillColor] = useState("transparent");
 	const [strokeWidth, setStrokeWidth] = useState(2);
+	const [eraserSize, setEraserSize] = useState(DEFAULT_ERASER_SIZE);
 	const [fontFamily, setFontFamily] = useState("Inter");
 	const [fontBold, setFontBold] = useState(false);
 	const [fontItalic, setFontItalic] = useState(false);
@@ -65,23 +99,46 @@ export default function WhiteboardPage() {
 
 	const canvasRef = useRef<FabricCanvasAPI | null>(null);
 	const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	/** Latest committed pages, so an unmount flush never saves stale state. */
+	const pagesRef = useRef(pages);
+	const activePageIndexRef = useRef(0);
 
 	useEffect(() => {
-		setPages(loadPages());
-		setLoaded(true);
-	}, []);
+		pagesRef.current = pages;
+	}, [pages]);
 
 	useEffect(() => {
-		if (loaded) {
-			if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-			saveTimerRef.current = setTimeout(() => savePages(pages), 500);
-		}
+		if (!hydrated) return;
+		if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+		saveTimerRef.current = setTimeout(() => savePages(pages), 500);
 		return () => {
 			if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
 		};
-	}, [pages, loaded]);
+	}, [pages, hydrated]);
 
-	const activePageIndexRef = useRef(0);
+	/**
+	 * The debounced save above must never lose its last batch: a tab close
+	 * or refresh is flushed from the live canvas here, and a client-side
+	 * unmount falls back to the latest committed state.
+	 */
+	useEffect(() => {
+		const flush = () => {
+			const canvas = canvasRef.current;
+			let next = pagesRef.current;
+			const idx = activePageIndexRef.current;
+			if (canvas && !canvas.isLoading() && next[idx]) {
+				next = [...next];
+				next[idx] = { ...next[idx], json: canvas.getJSON() };
+				pagesRef.current = next;
+			}
+			savePages(next);
+		};
+		window.addEventListener("pagehide", flush);
+		return () => {
+			window.removeEventListener("pagehide", flush);
+			flush();
+		};
+	}, []);
 
 	const goToPage = useCallback((index: number) => {
 		activePageIndexRef.current = index;
@@ -101,9 +158,6 @@ export default function WhiteboardPage() {
 		});
 	}, []);
 
-	const handleCanvasChange = saveCurrentPageToState;
-	const forceCurrentPageSave = saveCurrentPageToState;
-
 	const handleHistoryChange = useCallback((uc: boolean, rc: boolean) => {
 		setCanUndo(uc);
 		setCanRedo(rc);
@@ -111,27 +165,27 @@ export default function WhiteboardPage() {
 
 	const handleAddPage = useCallback(() => {
 		canvasRef.current?.flushEditing();
-		forceCurrentPageSave();
+		saveCurrentPageToState();
 		let maxNum = 0;
 		for (const p of pages) {
 			const match = p.name.match(/^Page (\d+)$/);
 			if (match) maxNum = Math.max(maxNum, Number(match[1]));
 		}
 		const newPage: Page = {
-			id: generateId(),
+			id: uid(),
 			name: `Page ${maxNum + 1}`,
 			json: {},
 		};
 		setPages((prev) => [...prev, newPage]);
 		goToPage(pages.length);
 		setPageKey((k) => k + 1);
-	}, [pages, forceCurrentPageSave, goToPage]);
+	}, [pages, saveCurrentPageToState, goToPage]);
 
 	const handleDeletePage = useCallback(
 		(index: number) => {
 			if (pages.length <= 1) return;
 			canvasRef.current?.flushEditing();
-			forceCurrentPageSave();
+			saveCurrentPageToState();
 			setPages((prev) => {
 				const next = prev.filter((_, i) => i !== index);
 				return next.map((p, i) => ({ ...p, name: `Page ${i + 1}` }));
@@ -141,7 +195,7 @@ export default function WhiteboardPage() {
 			else if (index === cur) goToPage(Math.min(cur, pages.length - 2));
 			setPageKey((k) => k + 1);
 		},
-		[pages.length, forceCurrentPageSave, goToPage],
+		[pages.length, saveCurrentPageToState, goToPage],
 	);
 
 	const handleRenamePage = useCallback((index: number, name: string) => {
@@ -155,11 +209,11 @@ export default function WhiteboardPage() {
 	const handleSelectPage = useCallback(
 		(index: number) => {
 			canvasRef.current?.flushEditing();
-			forceCurrentPageSave();
+			saveCurrentPageToState();
 			goToPage(index);
 			setPageKey((k) => k + 1);
 		},
-		[forceCurrentPageSave, goToPage],
+		[saveCurrentPageToState, goToPage],
 	);
 
 	const handleUndo = useCallback(() => canvasRef.current?.undo(), []);
@@ -190,16 +244,19 @@ export default function WhiteboardPage() {
 				return;
 			}
 
-			if (e.key === "v" || e.key === "V") setActiveTool("select");
-			else if (e.key === "d" || e.key === "D") setActiveTool("draw");
-			else if (e.key === "h" || e.key === "H") setActiveTool("highlighter");
-			else if (e.key === "r" || e.key === "R") setActiveTool("rect");
-			else if (e.key === "c" || e.key === "C") setActiveTool("circle");
-			else if (e.key === "l" || e.key === "L") setActiveTool("line");
-			else if (e.key === "a" || e.key === "A") setActiveTool("arrow");
-			else if (e.key === "t" || e.key === "T") setActiveTool("text");
-			else if (e.key === "s" || e.key === "S") setActiveTool("sticky");
-			else if (e.key === "e" || e.key === "E") setActiveTool("eraser");
+			// Never steal keys that belong to the browser or OS...
+			if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+			// ...but Delete/Backspace removes the selection (and with it every
+			// linked part of an arrow or sticky note).
+			if (e.key === "Delete" || e.key === "Backspace") {
+				e.preventDefault();
+				canvasRef.current?.deleteSelection();
+				return;
+			}
+
+			const tool = TOOL_SHORTCUTS[e.key.toLowerCase()];
+			if (tool) setActiveTool(tool);
 		};
 		window.addEventListener("keydown", handleKeyDown);
 		return () => window.removeEventListener("keydown", handleKeyDown);
@@ -224,7 +281,7 @@ export default function WhiteboardPage() {
 		[pages, activePageIndex],
 	);
 
-	if (!loaded) return null;
+	if (!hydrated) return null;
 
 	return (
 		<div className="app-layout">
@@ -270,6 +327,8 @@ export default function WhiteboardPage() {
 					onFillColorChange={setFillColor}
 					strokeWidth={strokeWidth}
 					onStrokeWidthChange={setStrokeWidth}
+					eraserSize={eraserSize}
+					onEraserSizeChange={setEraserSize}
 					fontFamily={fontFamily}
 					onFontFamilyChange={setFontFamily}
 					fontBold={fontBold}
@@ -287,13 +346,14 @@ export default function WhiteboardPage() {
 				<div className="app-canvas">
 					<FabricCanvas
 						ref={canvasRef}
-						onChange={handleCanvasChange}
+						onChange={saveCurrentPageToState}
 						onHistoryChange={handleHistoryChange}
 						onToolChange={setActiveTool}
 						tool={activeTool}
 						strokeColor={strokeColor}
 						fillColor={fillColor}
 						strokeWidth={strokeWidth}
+						eraserSize={eraserSize}
 						fontFamily={fontFamily}
 						fontBold={fontBold}
 						fontItalic={fontItalic}

@@ -1,7 +1,13 @@
 "use client";
 
 import { memo, type ReactNode } from "react";
-import { STICKY_COLORS } from "./diagramShapes";
+import {
+	ERASER_SIZES,
+	FONT_FAMILIES,
+	PALETTE_COLORS,
+	STICKY_COLORS,
+	STROKE_WIDTHS,
+} from "../lib/diagramConstants";
 import type { Tool } from "./FabricCanvas";
 
 interface ToolbarProps {
@@ -13,6 +19,8 @@ interface ToolbarProps {
 	onFillColorChange: (color: string) => void;
 	strokeWidth: number;
 	onStrokeWidthChange: (width: number) => void;
+	eraserSize: number;
+	onEraserSizeChange: (size: number) => void;
 	fontFamily: string;
 	onFontFamilyChange: (font: string) => void;
 	fontBold: boolean;
@@ -68,33 +76,12 @@ const TOOLS: { id: Tool; label: string; icon: ReactNode }[] = [
 	{ id: "draw", label: "Draw (D)", icon: "✎" },
 	{ id: "highlighter", label: "Highlighter (H)", icon: "🖍" },
 	{ id: "rect", label: "Rectangle (R)", icon: "□" },
-	{ id: "circle", label: "Circle (C)", icon: "○" },
+	{ id: "circle", label: "Ellipse (C)", icon: "○" },
 	{ id: "line", label: "Line (L)", icon: "/" },
 	{ id: "arrow", label: "Arrow (A)", icon: "→" },
 	{ id: "text", label: "Text (T)", icon: "T" },
 	{ id: "sticky", label: "Sticky note (S)", icon: "🗒" },
 	{ id: "eraser", label: "Eraser (E)", icon: EraserIcon },
-];
-
-const COLORS = [
-	"#000000",
-	"#e53e3e",
-	"#dd6b20",
-	"#d69e2e",
-	"#38a169",
-	"#3182ce",
-	"#805ad5",
-	"#d53f8c",
-	"#718096",
-	"#ffffff",
-];
-
-const STROKE_WIDTHS = [1, 2, 3, 5, 8];
-
-const FONT_FAMILIES = [
-	{ value: "Inter", label: "Inter" },
-	{ value: "Georgia", label: "Georgia" },
-	{ value: "Courier New", label: "Courier New" },
 ];
 
 function ToolbarComponent({
@@ -106,6 +93,8 @@ function ToolbarComponent({
 	onFillColorChange,
 	strokeWidth,
 	onStrokeWidthChange,
+	eraserSize,
+	onEraserSizeChange,
 	fontFamily,
 	onFontFamilyChange,
 	fontBold,
@@ -141,7 +130,7 @@ function ToolbarComponent({
 			<div className="toolbar-group">
 				<span className="toolbar-label">Stroke</span>
 				<div className="toolbar-colors">
-					{COLORS.map((c) => (
+					{PALETTE_COLORS.map((c) => (
 						<button
 							key={`stroke-${c}`}
 							type="button"
@@ -170,7 +159,7 @@ function ToolbarComponent({
 						onClick={() => onFillColorChange("transparent")}
 						title="No fill"
 					/>
-					{COLORS.filter((c) => c !== "#ffffff").map((c) => (
+					{PALETTE_COLORS.filter((c) => c !== "#ffffff").map((c) => (
 						<button
 							key={`fill-${c}`}
 							type="button"
@@ -209,6 +198,39 @@ function ToolbarComponent({
 			</div>
 
 			<div className="toolbar-divider" />
+
+			{activeTool === "eraser" && (
+				<>
+					<div className="toolbar-group">
+						<span className="toolbar-label">Eraser</span>
+						<div className="toolbar-widths">
+							{ERASER_SIZES.map((size) => (
+								<button
+									key={`eraser-${size}`}
+									type="button"
+									className={`toolbar-width ${
+										eraserSize === size ? "active" : ""
+									}`}
+									onClick={() => onEraserSizeChange(size)}
+									title={`${size}px`}
+								>
+									<span
+										style={{
+											display: "block",
+											width: `${Math.min(size, 20)}px`,
+											height: `${Math.min(size, 20)}px`,
+											borderRadius: "50%",
+											background: "currentColor",
+										}}
+									/>
+								</button>
+							))}
+						</div>
+					</div>
+
+					<div className="toolbar-divider" />
+				</>
+			)}
 
 			{activeTool === "sticky" && (
 				<>

@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { saveRecording } from "../lib/recordings/recordingsDb";
 import type { FabricCanvasAPI } from "./FabricCanvas";
 
 type RecordingState = "idle" | "recording" | "paused";
@@ -19,6 +20,7 @@ export default function RecordingControls({ canvasRef }: RecordingControlsProps)
 	const [state, setState] = useState<RecordingState>("idle");
 	const [elapsed, setElapsed] = useState(0);
 	const [error, setError] = useState<string | null>(null);
+	const [saved, setSaved] = useState(false);
 
 	const mediaRecorderRef = useRef<MediaRecorder | null>(null);
 	const streamRef = useRef<MediaStream | null>(null);
@@ -93,12 +95,18 @@ export default function RecordingControls({ canvasRef }: RecordingControlsProps)
 
 	const startRecording = useCallback(async () => {
 		setError(null);
+		setSaved(false);
 		const canvas = canvasRef.current;
 		if (!canvas) {
 			setError("Canvas not ready");
 			return;
 		}
 
+		// Whatever a failed start already acquired (streams, listeners,
+		// timers) is released in the catch below, so the mic and compositor
+		// never keep running behind an "idle" UI.
+		let acquiredStream: MediaStream | null = null;
+		let removeMouseMove: (() => void) | null = null;
 		try {
 			const canvasEl = canvas.getCanvasElement();
 			if (!canvasEl) {
@@ -106,7 +114,6 @@ export default function RecordingControls({ canvasRef }: RecordingControlsProps)
 				return;
 			}
 
-			const rect = canvasEl.getBoundingClientRect();
 			const composite = document.createElement("canvas");
 			composite.width = canvasEl.width;
 			composite.height = canvasEl.height;
@@ -128,6 +135,7 @@ export default function RecordingControls({ canvasRef }: RecordingControlsProps)
 				...(audioStream ? audioStream.getAudioTracks() : []),
 			];
 			const combinedStream = new MediaStream(tracks);
+			acquiredStream = combinedStream;
 
 			const mimeType = MediaRecorder.isTypeSupported(
 				"video/webm;codecs=vp9",
@@ -153,13 +161,8 @@ export default function RecordingControls({ canvasRef }: RecordingControlsProps)
 				const filename = `recording-${new Date().toISOString().replace(/[:.]/g, "-")}.webm`;
 
 				try {
-					const formData = new FormData();
-					formData.append("video", blob, filename);
-
-					await fetch("/api/recordings", {
-						method: "POST",
-						body: formData,
-					});
+					await saveRecording(blob, filename);
+					setSaved(true);
 				} catch {
 					setError("Failed to save recording");
 				}
@@ -184,6 +187,8 @@ export default function RecordingControls({ canvasRef }: RecordingControlsProps)
 			};
 
 			canvasEl.addEventListener("mousemove", handleMouseMove);
+			removeMouseMove = () =>
+				canvasEl.removeEventListener("mousemove", handleMouseMove);
 
 			mediaRecorderRef.current = recorder;
 			streamRef.current = combinedStream;
@@ -194,10 +199,23 @@ export default function RecordingControls({ canvasRef }: RecordingControlsProps)
 
 			const originalOnStop = recorder.onstop;
 			recorder.onstop = (event) => {
-				canvasEl.removeEventListener("mousemove", handleMouseMove);
+				removeMouseMove?.();
 				originalOnStop?.call(recorder, event);
 			};
 		} catch {
+			// Release everything the failed start already put in motion.
+			removeMouseMove?.();
+			stopCompositing();
+			stopTimer();
+			acquiredStream?.getTracks().forEach((t) => t.stop());
+			streamRef.current?.getTracks().forEach((t) => t.stop());
+			if (mediaRecorderRef.current?.state !== "inactive") {
+				mediaRecorderRef.current?.stop();
+			}
+			mediaRecorderRef.current = null;
+			streamRef.current = null;
+			compositeCanvasRef.current = null;
+			cursorRef.current = null;
 			setError("Failed to start recording");
 		}
 	}, [canvasRef, startTimer, stopTimer, startCompositing, stopCompositing, updateState]);
@@ -247,6 +265,9 @@ export default function RecordingControls({ canvasRef }: RecordingControlsProps)
 				>
 					● Record
 				</button>
+				{saved && (
+					<span className="recording-saved">✓ Saved to this browser</span>
+				)}
 			</div>
 		);
 	}

@@ -10,13 +10,14 @@
 	--sidebar-text: #333;
 	--toolbar-bg: #fafafa;
 	--toolbar-border: #e5e5e5;
+	--accent: #5b5bd6;
 }
 
 @theme inline {
 	--color-background: var(--background);
 	--color-foreground: var(--foreground);
-	--font-sans: var(--font-geist-sans);
-	--font-mono: var(--font-geist-mono);
+	--font-sans: var(--font-inter);
+	--font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -158,7 +159,7 @@ body {
 }
 
 .font-dropdown:focus {
-	border-color: #5b5bd6;
+	border-color: var(--accent);
 }
 
 .font-style-btn {
@@ -183,8 +184,8 @@ body {
 
 .font-style-btn.active {
 	background: #e8e8ff;
-	border-color: #5b5bd6;
-	color: #5b5bd6;
+	border-color: var(--accent);
+	color: var(--accent);
 	font-weight: bold;
 }
 
@@ -194,16 +195,9 @@ body {
 
 .font-style-btn.underline-active {
 	background: #e8e8ff;
-	border-color: #5b5bd6;
-	color: #5b5bd6;
+	border-color: var(--accent);
+	color: var(--accent);
 	text-decoration: underline;
-}
-
-.font-style-divider {
-	width: 1px;
-	height: 24px;
-	background: var(--toolbar-border);
-	margin: 0 2px;
 }
 
 .toolbar-btn {
@@ -228,8 +222,8 @@ body {
 
 .toolbar-btn.active {
 	background: #e8e8ff;
-	border-color: #5b5bd6;
-	color: #5b5bd6;
+	border-color: var(--accent);
+	color: var(--accent);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -279,8 +273,8 @@ body {
 }
 
 .toolbar-color.active {
-	border-color: #5b5bd6;
-	box-shadow: 0 0 0 1px #5b5bd6;
+	border-color: var(--accent);
+	box-shadow: 0 0 0 1px var(--accent);
 }
 
 .toolbar-widths {
@@ -309,7 +303,7 @@ body {
 
 .toolbar-width.active {
 	background: #e8e8ff;
-	border-color: #5b5bd6;
+	border-color: var(--accent);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -413,7 +407,7 @@ body {
 }
 
 .sidebar-page.active .sidebar-page-number {
-	background: #5b5bd6;
+	background: var(--accent);
 	color: #fff;
 }
 
@@ -435,7 +429,7 @@ body {
 	width: 100%;
 	font-size: 13px;
 	padding: 2px 4px;
-	border: 1px solid #5b5bd6;
+	border: 1px solid var(--accent);
 	border-radius: 3px;
 	background: var(--background);
 	color: var(--foreground);
@@ -482,8 +476,8 @@ body {
 
 .sidebar-add-page:hover {
 	background: var(--sidebar-hover);
-	border-color: #5b5bd6;
-	color: #5b5bd6;
+	border-color: var(--accent);
+	color: var(--accent);
 }
 
 .sidebar-page-count {
@@ -509,9 +503,9 @@ body {
 }
 
 .export-pdf-button:hover:not(:disabled) {
-	background: #5b5bd6;
+	background: var(--accent);
 	color: #fff;
-	border-color: #5b5bd6;
+	border-color: var(--accent);
 }
 
 .export-pdf-button:disabled {
@@ -620,4 +614,10 @@ body {
 .recording-error {
 	font-size: 11px;
 	color: #ef4444;
+}
+
+.recording-saved {
+	font-size: 11px;
+	color: #22c55e;
+	white-space: nowrap;
 }
